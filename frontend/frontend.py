@@ -36,6 +36,9 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x, imgproc=lambda
                         txt2img_cfg = gr.Slider(minimum=-40.0, maximum=30.0, step=0.5,
                                                 label='Classifier Free Guidance Scale (how strongly the image should follow the prompt)',
                                                 value=txt2img_defaults['cfg_scale'], elem_id='cfg_slider')
+                        txt2img_cfg_prompt = gr.Number(label="Sampling Steps Prompt",
+                                                       value=txt2img_defaults['cfg_scale'],
+                                                       precision=None)                        
                         txt2img_seed = gr.Textbox(label="Seed (blank to randomize)", lines=1, max_lines=1,
                                                   value=txt2img_defaults["seed"])
                         txt2img_batch_size = gr.Slider(minimum=1, maximum=50, step=1,
@@ -80,6 +83,7 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x, imgproc=lambda
                     with gr.Column():
                         txt2img_steps = gr.Slider(minimum=1, maximum=250, step=1, label="Sampling Steps",
                                                   value=txt2img_defaults['ddim_steps'])
+                        txt2img_steps_prompt = gr.Number(label="Sampling Steps Prompt")
                         txt2img_sampling = gr.Dropdown(label='Sampling method (k_lms is default k-diffusion sampler)',
                                                        choices=["DDIM", "PLMS", 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a',
                                                                 'k_euler', 'k_heun', 'k_lms'],
@@ -150,6 +154,26 @@ def draw_gradio_ui(opt, img2img=lambda x: x, txt2img=lambda x: x, imgproc=lambda
                     _js=js_parse_prompt
                 )
 
+                txt2img_steps_prompt.change(
+                    fn=None,
+                    inputs=[txt2img_steps_prompt],
+                    outputs=[txt2img_steps]
+                )
+                txt2img_steps.change(
+                    fn=None,
+                    inputs=[txt2img_steps],
+                    outputs=[txt2img_steps_prompt]
+                )
+                txt2img_cfg_prompt.change(
+                    fn=None,
+                    inputs=[txt2img_cfg_prompt],
+                    outputs=[txt2img_cfg]
+                )
+                txt2img_cfg.change(
+                    fn=None,
+                    inputs=[txt2img_cfg],
+                    outputs=[txt2img_cfg_prompt]
+                )
             with gr.TabItem("Image-to-Image Unified", id="img2img_tab"):
                 with gr.Row(elem_id="prompt_row"):
                     img2img_prompt = gr.Textbox(label="Prompt",
