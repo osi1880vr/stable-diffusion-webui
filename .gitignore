@@ -58,3 +58,6 @@ condaenv.*.requirements.txt
 /log/log.csv
 /flagged/*
 /gfpgan/*
+.vscode/settings.json
+.vscode/launch.json
+reset_pywin.bat

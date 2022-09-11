@@ -1,6 +1,6 @@
 @echo off
 
-set conda_env_name=ldm
+set conda_env_name=ldo_webui
 
 :: Put the path to conda directory after "=" sign if it's installed at non-standard path:
 set custom_conda_path=
