@@ -57,6 +57,9 @@ opt = parser.parse_args()
 #else:
 #    os.environ["CUDA_VISIBLE_DEVICES"] = str(opt.gpu)
 
+
+import traceback
+
 import gradio as gr
 import k_diffusion as K
 import math
@@ -97,6 +100,8 @@ from torch import autocast
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.util import instantiate_from_config
+
+from scripts.animation import animation_sample, save_animation
 
 # add global options to models
 def patch_conv(**patch):
@@ -305,11 +310,27 @@ class KDiffusionSampler:
         self.model = m
         self.model_wrap = K.external.CompVisDenoiser(m)
         self.schedule = sampler
+        self.sigma_start_index = 0
+        self.sigma_end_index = None
+
+    def set_sigma_start_end_indices(self, sigma_start_index, sigma_end_index): # Note: this is important for animation.
+        self.sigma_start_index = sigma_start_index
+        self.sigma_end_index = sigma_end_index
+
     def get_sampler_name(self):
         return self.schedule
     def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T):
         sigmas = self.model_wrap.get_sigmas(S)
-        x = x_T * sigmas[0]
+        #x = x_T * sigmas[0]
+        if self.sigma_start_index == 0:
+            x = x_T * sigmas[0]
+        else:
+            x = x_T
+
+        if self.sigma_end_index is not None:
+            sigmas = sigmas[self.sigma_start_index:self.sigma_end_index]
+        else:
+            sigmas = sigmas[self.sigma_start_index:]        
         model_wrap_cfg = CFGDenoiser(self.model_wrap)
 
         samples_ddim = K.sampling.__dict__[f'sample_{self.schedule}'](model_wrap_cfg, x, sigmas, extra_args={'cond': conditioning, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale}, disable=False)
@@ -637,7 +658,9 @@ def check_prompt_length(prompt, comments):
 
 
 def save_sample(image, sample_path_i, filename, jpg_sample, write_info_files, write_sample_info_to_log_file, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
-skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, skip_metadata=False):
+#skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, skip_metadata=False):
+skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, skip_metadata=True, animation_steps = None, animation_levels = None):
+
     ''' saves the image according to selected parameters. Expects to find generation parameters on image, set by ImageMetadata.set_on_image() '''
     metadata = ImageMetadata.get_from_image(image)
     if not skip_metadata and metadata is None:
@@ -689,6 +712,11 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
             #info_dict["init_mask"] = init_mask
             info_dict["denoising_strength"] = denoising_strength
             info_dict["resize_mode"] = resize_mode
+        if animation_levels is not None:
+            info_dict["animation_levels"] = animation_levels
+        if animation_steps is not None:
+            info_dict["animation_steps"] = animation_steps
+
         if write_info_files:
             with open(f"{filename_i}.yaml", "w", encoding="utf8") as f:
                 yaml.dump(info_dict, f, allow_unicode=True, width=10000)
@@ -729,7 +757,8 @@ def get_next_sequence_number(path, prefix=''):
     """
     result = -1
     for p in Path(path).iterdir():
-        if p.name.endswith(('.png', '.jpg')) and p.name.startswith(prefix):
+        #if p.name.endswith(('.png', '.jpg')) and p.name.startswith(prefix):
+        if (p.name.endswith(('.png', '.jpg')) and p.name.startswith(prefix)) or p.is_dir():            
             tmp = p.name[len(prefix):]
             try:
                 result = max(int(tmp.split('-')[0]), result)
@@ -862,7 +891,9 @@ def process_images(
         fp, ddim_eta=0.0, do_not_save_grid=False, normalize_prompt_weights=True, init_img=None, init_mask=None,
         keep_mask=False, mask_blur_strength=3, mask_restore=False, denoising_strength=0.75, resize_mode=None, uses_loopback=False,
         uses_random_seed_loopback=False, sort_samples=True, write_info_files=True, write_sample_info_to_log_file=False, jpg_sample=False,
-        variant_amount=0.0, variant_seed=None,imgProcessorTask=False, job_info: JobInfo = None, do_color_correction=False, correction_target=None):
+        #variant_amount=0.0, variant_seed=None,imgProcessorTask=False, job_info: JobInfo = None, do_color_correction=False, correction_target=None):
+        variant_amount=0.0, variant_seed=None,imgProcessorTask=False, job_info: JobInfo = None, do_color_correction=False, correction_target=None,
+        sampler=None, output_video=False, animation_levels=None, animation_steps=None):        
     """this is the main loop that both txt2img and img2img use; it calls func_init once inside all the scopes and func_sample once per batch"""
 
     def numpy_to_pil(images):
@@ -904,6 +935,7 @@ def process_images(
     torch_gc()
     # start time after garbage collection (or before?)
     start_time = time.time()
+    output_video_path = None
 
     mem_mon = MemUsageMonitor('MemMon')
     mem_mon.start()
@@ -924,6 +956,18 @@ def process_images(
         prompt, negprompt = prompt.split('###', 1)
         prompt = prompt.strip()
         negprompt = negprompt.strip()
+
+    animation_prompt = False
+    num_animation_frames = 1
+    if prompt.find("~") != -1:
+        animation_prompt = True
+        prompt_start = prompt[:prompt.find("~")]
+        prompt_end = prompt[prompt.find("~")+1:]
+        num_animation_frames = n_iter
+        n_iter = 1
+        VIDEO_FORMAT = "mp4" # TODO: make parameter.
+        print(f"creating animation between '{prompt_start}' => '{prompt_end}', frames: {num_animation_frames}")
+
 
     comments = []
 
@@ -952,6 +996,9 @@ def process_images(
             all_seeds = len(all_prompts) * [seed]
 
         print(f"Prompt matrix will create {len(all_prompts)} images using a total of {n_iter} batches.")
+    elif animation_prompt:
+        all_prompts = [f"{prompt_start}~{prompt_end}" for i in range(num_animation_frames)]
+        all_seeds = [seed] * num_animation_frames              
     else:
 
         if not opt.no_verify_input:
@@ -1001,6 +1048,11 @@ def process_images(
             seeds = all_seeds[n * batch_size:(n + 1) * batch_size]
             current_seeds = original_seeds[n * batch_size:(n + 1) * batch_size]
 
+            if animation_prompt:
+                prompts = all_prompts
+                seeds = all_seeds
+                current_seeds = all_seeds
+
             if job_info:
                 job_info.job_status = f"Processing Iteration {n+1}/{n_iter}. Batch size {batch_size}"
                 for idx,(p,s) in enumerate(zip(prompts,seeds)):
@@ -1037,7 +1089,11 @@ def process_images(
             cur_variant_amount = variant_amount
             if variant_amount == 0.0:
                 # we manually generate all input noises because each one should have a specific seed
-                x = create_random_tensors(shape, seeds=seeds)
+                #x = create_random_tensors(shape, seeds=seeds)
+                if animation_prompt:
+                    x = create_random_tensors(shape, seeds=seeds[:1])
+                else:
+                    x = create_random_tensors(shape, seeds=seeds)                
             else: # we are making variants
                 # using variant_seed as sneaky toggle,
                 # when not None or '' use the variant_seed
@@ -1057,14 +1113,40 @@ def process_images(
                 # finally, slerp base_x noise to target_x noise for creating a variant
                 x = slerp(device, max(0.0, min(1.0, cur_variant_amount)), base_x, target_x)
 
-            samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
+            #samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
+            if animation_prompt:
+                maybe_modelCS = (model if not opt.optimized else modelCS)
+                samples_ddim = animation_sample(prompt_start=prompt_start, prompt_end=prompt_end, num_animation_frames=num_animation_frames, steps=steps, func_sample=func_sample, sampler=sampler, init_data=init_data, x=x, sampler_name=sampler_name, batch_size = batch_size, maybe_modelCS=maybe_modelCS, animation_levels=animation_levels, animation_steps=animation_steps, job_info = job_info)
+                # Sometimes more frames are generated:
+                if num_animation_frames != len(samples_ddim):
+                    num_animation_frames = len(samples_ddim)
+                    prompts = [f"{prompt_start}~{prompt_end}" for i in range(num_animation_frames)]
+                    seeds = [seed] * num_animation_frames
+                    current_seeds = [seed] * num_animation_frames
+            else:
+                samples_ddim = func_sample(init_data=init_data, x=x, conditioning=c, unconditional_conditioning=uc, sampler_name=sampler_name)
 
             if opt.optimized:
                 modelFS.to(device)
 
+
             for i in range(len(samples_ddim)):
-                x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim[i].unsqueeze(0))
-                x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+                #x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim[i].unsqueeze(0))
+                #x_sample = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                if animation_prompt:
+                    # Can't decode too many animation frames in parallel.
+                    x_samples_ddim = torch.cat([
+                    torch.clamp(
+                    ((model if not opt.optimized else modelFS).decode_first_stage(samples_ddim[i][None]) + 1.0)/2.0
+                    , min=0.0, max=1.0).cpu()
+                    for i in range(samples_ddim.shape[0])
+                    ])
+                else:
+                    x_samples_ddim = (model if not opt.optimized else modelFS).decode_first_stage(samples_ddim)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0)
+
+                base_filename = None                
 
                 if filter_nsfw:
                     x_samples_ddim_numpy = x_sample.cpu().permute(0, 2, 3, 1).numpy()
@@ -1101,6 +1183,13 @@ def process_images(
                 filename = filename.replace("[SAMPLER]", sampler_name)
                 filename = filename.replace("[SEED]", seed_used)
                 filename = filename.replace("[VARIANT_AMOUNT]", f"{cur_variant_amount:.2f}")
+
+                if animation_prompt:
+                    if base_filename is None:
+                        base_filename = f"{base_count:05}-{steps}_{sampler_name}_{seed_used}"
+                        base_path = os.path.join(sample_path_i, base_filename)
+                        os.makedirs(base_path, exist_ok=True)
+                    filename = os.path.join(base_filename, f"{i}")
 
                 x_sample = 255. * rearrange(x_sample[0].cpu().numpy(), 'c h w -> h w c')
                 x_sample = x_sample.astype(np.uint8)
@@ -1190,7 +1279,9 @@ skip_save, skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, 
 
                 if not skip_save:
                     save_sample(image, sample_path_i, filename, jpg_sample, write_info_files, write_sample_info_to_log_file, prompt_matrix, init_img, uses_loopback, uses_random_seed_loopback, skip_save,
-skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
+#skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False)
+skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoising_strength, resize_mode, False, animation_levels=animation_levels, animation_steps=animation_steps)
+
                 if add_original_image or not simple_templating:
                     output_images.append(image)
                     if simple_templating:
@@ -1202,7 +1293,14 @@ skip_grid, sort_samples, sampler_name, ddim_eta, n_iter, batch_size, i, denoisin
                 while(torch.cuda.memory_allocated()/1e6 >= mem):
                     time.sleep(1)
 
-        if (prompt_matrix or not skip_grid) and not do_not_save_grid:
+ #       if (prompt_matrix or not skip_grid) and not do_not_save_grid:
+         # END of for n iter
+        # -----------------
+        if animation_prompt:
+            output_video_path = os.path.join(base_path, "animation." + VIDEO_FORMAT)
+            save_animation(output_images,output_video_path) # TODO: codec parameters.
+
+        if (prompt_matrix or not skip_grid) and not do_not_save_grid and not animation_prompt:
             grid = None
             if prompt_matrix:
                 if simple_templating:
@@ -1253,12 +1351,17 @@ Peak memory usage: { -(mem_max_used // -1_048_576) } MiB / { -(mem_total // -1_0
     #del mem_mon
     torch_gc()
 
+    if output_video:
+        return output_images, output_video_path, seed, info, stats
+
     return output_images, seed, info, stats
 
 
 def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int], realesrgan_model_name: str,
             ddim_eta: float, n_iter: int, batch_size: int, cfg_scale: float, seed: Union[int, str, None],
-            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None, job_info: JobInfo = None):
+            #height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None, job_info: JobInfo = None):
+            height: int, width: int, fp, variant_amount: float = None, variant_seed: int = None, animation_steps = None, animation_levels = None, job_info: JobInfo = None):
+
     outpath = opt.outdir_txt2img or opt.outdir or "outputs/txt2img-samples"
     err = False
     seed = seed_to_int(seed)
@@ -1313,7 +1416,8 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
         return samples_ddim
 
     try:
-        output_images, seed, info, stats = process_images(
+        #output_images, seed, info, stats = process_images(
+        output_images, video_output, seed, info, stats = process_images(            
             outpath=outpath,
             func_init=init,
             func_sample=sample,
@@ -1345,16 +1449,27 @@ def txt2img(prompt: str, ddim_steps: int, sampler_name: str, toggles: List[int],
             job_info=job_info,
             do_color_correction=do_color_correction,
             correction_target=correction_target
+            sampler=sampler,  # sampler is needed for animation.
+            output_video=True, # return video output parameter.
+            animation_levels=animation_levels,
+            animation_steps=animation_steps            
         )
 
         del sampler
 
-        return output_images, seed, info, stats
+        #return output_images, seed, info, stats
+        return output_images, video_output, seed, info, stats        
     except RuntimeError as e:
         err = e
-        err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
+        #err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{str(e)}</textarea><br><br>Please wait while the program restarts.'
+        exc_type, exc_value, exc_traceback = sys.exc_info()
+        err_str = '\n'.join(traceback.format_exception(exc_type, exc_value, exc_traceback))
+        err_msg = f'CRASHED:<br><textarea rows="5" style="color:white;background: black;width: -webkit-fill-available;font-family: monospace;font-size: small;font-weight: bold;">{err_str}</textarea><br><br>Please wait while the program restarts.'
+        
         stats = err_msg
-        return [], seed, 'err', stats
+        #return [], seed, 'err', stats
+        print(f"got exception:\n {err_str}")
+        return [], None, seed, 'err', stats        
     finally:
         if err:
             crash(err, '!!Runtime error (txt2img)!!')
@@ -2276,6 +2391,8 @@ txt2img_defaults = {
     'variant_amount': 0.0,
     'variant_seed': '',
     'submit_on_enter': 'Yes',
+    'animation_steps' : None,
+    'animation_levels' : None    
 }
 
 if 'txt2img' in user_defaults:

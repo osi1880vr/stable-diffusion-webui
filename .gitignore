@@ -64,3 +64,5 @@ condaenv.*.requirements.txt
 /flagged/*
 /gfpgan/*
 /models/custom/
+
+openh264-1.8.0-win64.dll
