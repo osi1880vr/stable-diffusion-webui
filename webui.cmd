@@ -42,8 +42,8 @@ IF "%CONDA_PATH%"=="" (
   exit /b 1
 )
 
-call git stash
-call git pull
+#call git stash
+#call git pull
 
 :foundPath
 call "%CONDA_PATH%\Scripts\activate.bat"
